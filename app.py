@@ -1,6 +1,7 @@
 import re
 import sys
 import time
+import numpy as np
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
@@ -9,8 +10,10 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment
  
 # ---------------- CONFIGURAÇÕES ----------------
-BALANCETE_XLSX = r"Z:\Felipe Nascimento\Laura\Projeto Copilot\BalanceteDiárioPadrão_Teste.xlsx"  # <--- Modificar o caminho
-DEM_PL_IN  = r"Z:\Felipe Nascimento\Laura\Projeto Copilot\Dem-PL_Modelo.xlsx" # <--- Modificar o caminho
+
+MOVIMENTO_COTISTAS_PATH = "Z:\Felipe Nascimento\Laura\Projeto Copilot - (Felipe)\Fundo100Movimento de Cotistas-4.csv"
+BALANCETE_XLSX = r"Z:\Felipe Nascimento\Laura\Projeto Copilot - (Felipe)\BalanceteDiárioPadrão_Teste.xlsx"  # <--- Modificar o caminho
+DEM_PL_IN  = r"Z:\Felipe Nascimento\Laura\Projeto Copilot - (Felipe)\Dem-PL_Modelo1.xlsx" # <--- Modificar o caminho
 DEM_PL_OUT = r"Dem_PL_Modelo_preenchido.xlsx" # <--- Modificar o caminho
  
  
@@ -30,11 +33,8 @@ BLOCOS_RECONHECIDOS = {
     "Demais receitas": "RECEITAS",
     "Demais despesas": "DESPESAS",
 }
-# ✅ Formatação desejada:
-# - separador de milhar
-# - sem casas decimais
-# - negativos entre parênteses
-# - zero vira "-"
+
+ 
 NUM_FMT_INT_MIL = "#,##0;(#,##0);-"
 ALIGN_RIGHT = Alignment(horizontal="right")
 # ---------------- FUNÇÕES ----------------
@@ -60,6 +60,18 @@ def build_account_map(balancete_path: Path, sheet, col_conta, col_saldo) -> Dict
     contas = s_conta.str.extract(r"(\d+)", expand=False)
     tmp = pd.DataFrame({"conta": contas, "saldo": s_saldo}).dropna(subset=["conta"])
     return tmp.groupby("conta")["saldo"].sum().to_dict()
+
+
+def format_valor_milhares(valor: int) -> str:
+    """Formata valor conforme regras: negativo entre parênteses, zero como '-', separador milhar com ponto."""
+    if valor == 0:
+        return "-"
+    elif valor < 0:
+        return f"({abs(valor):,})".replace(",", ".")
+    else:
+        return f"{valor:,}".replace(",", ".")
+
+
 def normalize_text_for_accounts(s: str) -> str:
     s = s.replace("\xa0", " ")
     s = s.replace("R$", "").replace(".", "")
@@ -96,38 +108,180 @@ def apply_int_mil_format(cell):
     cell.number_format = NUM_FMT_INT_MIL
     cell.alignment = ALIGN_RIGHT
  
+ # --- [NOVO] Utilitários para CNPJ --------------------------------------------
+def only_digits(s: str) -> str:
+    import re
+    return re.sub(r"\D+", "", s or "")
+ 
+def mask_cnpj(cnpj: str) -> str:
+    """
+    Aplica máscara 00.000.000/0000-00 se houver 14 dígitos;
+    caso contrário, retorna o próprio valor sem máscara.
+    """
+    d = only_digits(cnpj)
+    if len(d) != 14:
+        return cnpj  # devolve como vier (evita falha se a origem estiver irregular)
+    return f"{d[0:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:14]}"
+ 
+ 
+ 
+def extract_cnpj_digits(val) -> Optional[str]:
+    """
+    Extrai exatamente 14 dígitos de um valor vindo do Balancete, lidando com:
+    - floats terminando com .0 (ex.: 43096339000146.0)
+    - inteiros
+    - strings (com ou sem máscara)
+    Retorna a string de 14 dígitos ou None.
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+ 
+    # Caso 1: inteiro "puro"
+    if isinstance(val, (int, np.integer)):
+        d = f"{val:d}"
+        return d.zfill(14) if len(d) <= 14 else (d[-14:] if len(d) > 14 else d)
+ 
+    # Caso 2: float
+    if isinstance(val, float):
+        # Se for .0, convertemos para int sem casas
+        if float(val).is_integer():
+            d = f"{int(val):d}"
+            return d.zfill(14) if len(d) <= 14 else (d[-14:] if len(d) > 14 else d)
+        # Se não for inteiro, extraímos só dígitos
+        s = str(val)
+        digits = only_digits(s)
+        # tenta achar um bloco de 14 dígitos
+        m = re.search(r"(\d{14})", digits)
+        return m.group(1) if m else (digits if len(digits) == 14 else None)
+ 
+    # Caso 3: str (ou outros)
+    s = str(val).strip()
+    digits = only_digits(s)
+    # Tenta capturar exatamente 14 dígitos
+    m = re.search(r"(\d{14})", digits)
+    if m:
+        return m.group(1)
+    # fallback: se tiver mais de 14, ficar com os 14 primeiros
+    if len(digits) >= 14:
+        return digits[:14]
+    return None
+ 
+ 
+def mask_cnpj_from_value(val) -> Optional[str]:
+    """Usa extract_cnpj_digits e aplica a máscara 00.000.000/0000-00."""
+    digits = extract_cnpj_digits(val)
+    if not digits or len(digits) != 14:
+        return None
+    return f"{digits[0:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:14]}"
+ 
+ 
+def get_cnpj_from_balancete(balancete_path: Path, sheet: Optional[Union[str, int]] = None) -> Optional[str]:
+    """
+    Procura a coluna 'Cnpj' (case-insensitive). Se não houver, usa a coluna G (índice 6).
+    Retorna já no formato: 'CNPJ: 00.000.000/0000-00'.
+    """
+    df = _read_balancete_df(balancete_path, sheet)
+ 
+    # 1) tenta encontrar a coluna 'Cnpj'
+    cnpj_col = None
+    for col in df.columns:
+        if str(col).strip().lower() == "cnpj":
+            cnpj_col = col
+            break
+ 
+    # 2) escolhe a série (ou fallback para coluna G)
+    series = None
+    if cnpj_col is not None:
+        series = df[cnpj_col]
+    else:
+        try:
+            series = df.iloc[:, 6]  # G = índice 6 (A=0)
+        except Exception:
+            return None
+ 
+    # 3) percorre até achar um valor válido
+    for val in series:
+        masked = mask_cnpj_from_value(val)
+        if masked:
+            return f"CNPJ: {masked}"
+    return None
+# -----------------------------------------------------------------------------
+ 
  
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from openpyxl import load_workbook
-
-def replace_in_dem_pl(dem_in: Path, dem_out: Path, acc_map: Dict[str, float]) -> Path:
+ 
+def replace_in_dem_pl(
+    dem_in: Path,
+    dem_out: Path,
+    acc_map: Dict[str, float],
+    cnpj_str: Optional[str] = None
+) -> Path:
+    """
+    Abre o modelo Dem-PL, percorre todas as abas substituindo células que contenham
+    referências a contas do balancete pelas somas correspondentes (em milhares, com
+    arredondamento half-up), acumula os totais por bloco e atualiza:
+      - J34 (Ações e Opções)
+      - J40 (Renda fixa e outros valores mobiliários)
+      - J45 (Demais receitas)
+      - J55 (Demais despesas)
+      - J58 (Total geral = soma de J34+J40+J45+J55)
+      - L8  (CNPJ prefixado: "CNPJ: 00.000.000/0000-00", como texto)
+ 
+    Ao final, salva com 'safe_save_workbook' (que lida com arquivo bloqueado)
+    e retorna o caminho efetivo gerado.
+ 
+    Parâmetros
+    ----------
+    dem_in : Path
+        Caminho do arquivo modelo de entrada (.xlsx).
+    dem_out : Path
+        Caminho desejado para o arquivo de saída (.xlsx).
+    acc_map : Dict[str, float]
+        Mapa {codigo_conta: saldo_em_reais} extraído do balancete.
+    cnpj_str : Optional[str]
+        Texto já formatado do CNPJ (ex.: "CNPJ: 00.000.000/0000-00"). Se None, não escreve.
+    """
+    # Abre o workbook do modelo
     wb = load_workbook(dem_in, data_only=False)
+ 
+    # Acumuladores opcionais (mantidos caso você queira usar no futuro)
     changes = []
     totals_por_conta = {}
     missing_codes = {}
+ 
+    # Somatórios por bloco (em milhares)
     soma_blocos = {"ACOES": 0, "RENDA_FIXA": 0, "RECEITAS": 0, "DESPESAS": 0}
     bloco_atual = None
-
+ 
+    # ---------------------------
+    # Passo 1: Varre TODAS as abas e substitui as células "calculáveis"
+    # ---------------------------
     for ws in wb.worksheets:
         for row in ws.iter_rows():
+            # Verifica o bloco pela coluna A (primeira coluna)
             col_a_val = row[0].value
             if isinstance(col_a_val, str):
                 key = col_a_val.strip()
                 if key in BLOCOS_RECONHECIDOS:
                     bloco_atual = BLOCOS_RECONHECIDOS[key]
-
+ 
             for cell in row:
+                # Não mexer nas células de total consolidadas
                 if cell.coordinate.upper() in TOTAL_CELLS:
                     continue
+ 
+                # Só tentamos substituir se a célula "parece" conter contas
                 if not should_replace_cell(cell.value):
                     continue
-
+ 
                 raw_expr = str(cell.value)
                 contas = parse_accounts_from_cell(raw_expr)
                 if not contas:
                     continue
-
+ 
+                # Soma em reais das contas existentes no mapa
                 total_reais = 0.0
                 for c in contas:
                     v = float(acc_map.get(c, 0.0))
@@ -135,17 +289,27 @@ def replace_in_dem_pl(dem_in: Path, dem_out: Path, acc_map: Dict[str, float]) ->
                     totals_por_conta[c] = totals_por_conta.get(c, 0.0) + v
                     if c not in acc_map:
                         missing_codes[c] = missing_codes.get(c, 0) + 1
-
+ 
+                # Converte para inteiro em milhares, com arredondamento HALF_UP
                 val_mil = round_thousands_cell(total_reais)
+ 
+                # Escreve o valor e aplica formatação
                 cell.value = val_mil
                 apply_int_mil_format(cell)
+ 
+                # Log opcional da mudança
                 changes.append((f"{ws.title}!{cell.coordinate}", raw_expr, total_reais, val_mil))
-
+ 
+                # Acumula no bloco atual (se estivermos dentro de um bloco reconhecido)
                 if bloco_atual in soma_blocos:
                     soma_blocos[bloco_atual] += val_mil
-
-    # ---- ATUALIZAÇÕES NA 1ª PLANILHA ----
+ 
+    # ---------------------------
+    # Passo 2: Atualiza a 1ª ABA com os somatórios e o total geral
+    # ---------------------------
     ws0 = wb.worksheets[0]
+ 
+    # Preenche cada célula de bloco
     for coord, key in [
         (CEL_BLOCO_ACOES, "ACOES"),
         (CEL_BLOCO_RENDA_FIXA, "RENDA_FIXA"),
@@ -154,7 +318,8 @@ def replace_in_dem_pl(dem_in: Path, dem_out: Path, acc_map: Dict[str, float]) ->
     ]:
         ws0[coord].value = soma_blocos[key]
         apply_int_mil_format(ws0[coord])
-
+ 
+    # Total geral (J58) = soma dos inteiros em milhares
     CEL_TOTAL_GERAL = "J58"
     total_geral = (
         soma_blocos["ACOES"]
@@ -165,31 +330,146 @@ def replace_in_dem_pl(dem_in: Path, dem_out: Path, acc_map: Dict[str, float]) ->
     ws0[CEL_TOTAL_GERAL].value = total_geral
     apply_int_mil_format(ws0[CEL_TOTAL_GERAL])
 
-    # ---- SALVAR E RETORNAR CAMINHO EFETIVO ----
-    out_path = Path(dem_out)
-    if SAFE_SAVE_WITH_SUFFIX:
-        out_path = safe_save_workbook(wb, out_path)
-    else:
-        wb.save(out_path)
+
+    # --- NOVO: incluir conta 61180 na célula J23 ---
+    CONTA_EXTRA = "61180"
+    CEL_EXTRA = "J23"
+
+    # Busca saldo da conta no mapa acc_map (já carregado do balancete)
+    saldo_reais = float(acc_map.get(CONTA_EXTRA, 0.0))
+
+    # Converte para milhares e arredonda
+    valor_mil = round_thousands_cell(saldo_reais)
+
+    # Formata conforme regra
+    valor_formatado = format_valor_milhares(valor_mil)
+
+    # Escreve na célula J23
+    ws0[CEL_EXTRA].value = valor_formatado
+    ws0[CEL_EXTRA].number_format = "@"
+
+
+ 
+    # ---------------------------
+    # Passo 3: CNPJ em L8 (como texto), se informado
+    # ---------------------------
+    if cnpj_str:
+        ws0["L8"].value = str(cnpj_str)      # garante string
+        ws0["L8"].number_format = "@"        # força formato TEXTO
+        try:
+            ws0["L8"].alignment = ALIGN_RIGHT
+        except Exception:
+            pass
+ 
+    # ---------------------------
+    # Passo 4: Salvar e retornar o caminho efetivo
+    # ---------------------------
+    path_saida = safe_save_workbook(wb, dem_out)
  
  
+def preencher_movimento_cotistas(dem_out: Path, mov_path: Path):
+    """
+    Lê o arquivo Movimento de Cotistas (CSV), ajusta cabeçalho, extrai os últimos valores
+    das colunas NCATOT_Tot e NCRTOT_Tot, formata e escreve nas células D20 e D22 do Excel.
+    """
+    try:
+        # 1. Verificar se os arquivos existem
+        if not mov_path.exists():
+            print(f"ERRO — Arquivo Movimento de Cotistas não encontrado: {mov_path}")
+            return
+        if not dem_out.exists():
+            print(f"ERRO — Arquivo Dem_PL_Modelo_preenchido não encontrado: {dem_out}")
+            return
+
+        # 2. Ler todas as linhas do CSV
+        with open(mov_path, 'r', encoding='latin1') as f:
+            linhas = f.readlines()
+
+        if len(linhas) < 2:
+            print("ERRO — Arquivo Movimento de Cotistas está vazio ou inválido.")
+            return
+
+        # 3. Ajustar cabeçalho (última linha vira header)
+        header = linhas[-1].strip().split(';')
+        dados = linhas[:-1]
+
+        # 4. Criar DataFrame com pandas
+        df_mov = pd.DataFrame([linha.strip().split(';') for linha in dados], columns=header)
+
+        # 5. Verificar colunas
+        if 'NCATOT_Tot' not in df_mov.columns or 'NCRTOT_Tot' not in df_mov.columns:
+            print("ERRO — Colunas NCATOT_Tot ou NCRTOT_Tot não encontradas no arquivo.")
+            return
+
+        # 6. Extrair últimos valores
+        valor_ncatot = df_mov['NCATOT_Tot'].dropna().iloc[-1]
+        valor_ncrtot = df_mov['NCRTOT_Tot'].dropna().iloc[-1]
+
+        # 7. Converter para float (tratando vírgula e ponto)
+        valor_ncatot = float(str(valor_ncatot).replace('.', '').replace(',', '.'))
+        valor_ncrtot = float(str(valor_ncrtot).replace('.', '').replace(',', '.'))
+
+        # 8. Formatar padrão brasileiro (milhar com ponto, decimal com vírgula)
+        def formatar(valor):
+            return f"{valor:,.3f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+        valor_formatado_ncatot = formatar(valor_ncatot)
+        valor_formatado_ncrtot = formatar(valor_ncrtot)
+
+        # 9. Abrir Excel e escrever nas células D20 e D22
+        wb = load_workbook(dem_out)
+        ws = wb.worksheets[0]
+
+        ws['D20'].value = valor_formatado_ncatot
+        ws['D22'].value = valor_formatado_ncrtot
+
+        ws['D20'].number_format = '@'
+        ws['D22'].number_format = '@'
+
+        # 10. Salvar arquivo
+        wb.save(dem_out)
+
+        print("[OK] Valores inseridos com sucesso:")
+        print(f"D20 (NCATOT_Tot): {valor_formatado_ncatot}")
+        print(f"D22 (NCRTOT_Tot): {valor_formatado_ncrtot}")
+
+    except Exception as e:
+        print(f"ERRO — Falha ao preencher Movimento de Cotistas: {e}")
+
  
+
+
 def main():
     bal = Path(BALANCETE_XLSX)
     dem_in = Path(DEM_PL_IN)
-    
+    mov_path = Path(MOVIMENTO_COTISTAS_PATH)
+
     if not bal.exists():
         print("ERRO — Balancete não encontrado:", bal)
         sys.exit(1)
-        
     if not dem_in.exists():
         print("ERRO — Modelo não encontrado:", dem_in)
         sys.exit(1)
-        
+
+    # 1) mapa de contas
     acc_map = build_account_map(bal, BALANCETE_SHEET, COL_CONTA, COL_SALDO)
-    out_file = replace_in_dem_pl(dem_in, Path(DEM_PL_OUT), acc_map)
+
+    # 2) captura CNPJ
+    cnpj_str = get_cnpj_from_balancete(bal, BALANCETE_SHEET)
+
+    # 3) executa preenchimento Dem-PL
+    out_file = replace_in_dem_pl(dem_in, Path(DEM_PL_OUT), acc_map, cnpj_str)
+
+    # 4) executa preenchimento Movimento de Cotistas (D20 e D22)
+    preencher_movimento_cotistas(Path(DEM_PL_OUT), mov_path)
+
     print("\n[ OK ] Concluído!")
     print(f"Arquivo gerado: {out_file}")
-    
+    if cnpj_str:
+        print(f"CNPJ escrito em L8: {cnpj_str}")
+    else:
+        print("Não foi possível localizar CNPJ no balancete (coluna 'Cnpj' ou G).")
+
+       
 if __name__ == "__main__":
     main()
