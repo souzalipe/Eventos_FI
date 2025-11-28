@@ -10,10 +10,10 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment
  
 # ---------------- CONFIGURAÇÕES ----------------
-
-MOVIMENTO_COTISTAS_PATH = "Z:\Felipe Nascimento\Laura\Projeto Copilot - (Felipe)\Fundo100Movimento de Cotistas-4.csv"
-BALANCETE_XLSX = r"Z:\Felipe Nascimento\Laura\Projeto Copilot - (Felipe)\BalanceteDiárioPadrão_Teste.xlsx"  # <--- Modificar o caminho
-DEM_PL_IN  = r"Z:\Felipe Nascimento\Laura\Projeto Copilot - (Felipe)\Dem-PL_Modelo1.xlsx" # <--- Modificar o caminho
+CARTEIRA_CSV = Path(r"Z:\Felipe Nascimento\Laura\Projeto Copilot\Carteira Diária(52).csv")
+MOVIMENTO_COTISTAS_PATH = "Z:\Felipe Nascimento\Laura\Projeto Copilot\Fundo_100Movimento_de_Cotistas_4.csv"
+BALANCETE_XLSX = r"Z:\Felipe Nascimento\Laura\Projeto Copilot\BalanceteDiárioPadrão_Teste.xlsx"  # <--- Modificar o caminho
+DEM_PL_IN  = r"Z:\Felipe Nascimento\Laura\Projeto Copilot\Dem-PL_Modelo1.xlsx" # <--- Modificar o caminho
 DEM_PL_OUT = r"Dem_PL_Modelo_preenchido.xlsx" # <--- Modificar o caminho
  
  
@@ -207,6 +207,161 @@ def get_cnpj_from_balancete(balancete_path: Path, sheet: Optional[Union[str, int
     return None
 # -----------------------------------------------------------------------------
  
+
+
+def get_last_ncotas(carteira_csv: Path) -> Optional[str]:
+    """
+    Lê 'Carteira Diária', usa o header da penúltima linha como cabeçalho,
+    pega o último valor válido da coluna 'NCotas', e devolve como texto
+    com pontuação de milhar (.) e 3 casas decimais (,) — ex.: 123.519.889,535.
+    """
+    import io
+
+    # 1) Ler o arquivo "cru" com encoding correto e sem assumir header
+    with open(carteira_csv, "r", encoding="latin-1", errors="ignore") as f:
+        raw_lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+
+    if len(raw_lines) < 2:
+        return None
+
+    # 2) A penúltima linha é o header; a última linha geralmente é rodapé/outro bloco
+    header_line = raw_lines[-2]
+    data_lines = raw_lines[:-2]  # todas as linhas antes do header
+
+    # 3) Monta um CSV em memória com o header na primeira linha + os dados abaixo
+    csv_text = "\n".join([header_line] + data_lines)
+
+    # 4) Lê com separador ';' e decimal ',' (isso já converte strings numéricas corretamente)
+    df = pd.read_csv(io.StringIO(csv_text),
+                     sep=";",
+                     decimal=",",
+                     engine="python",
+                     encoding="latin-1")
+
+    # 5) Garante que a coluna existe (atenção a espaços/maiúsculas/minúsculas)
+    #    Normaliza nomes de colunas tirando espaços extras
+    df.columns = [str(c).strip() for c in df.columns]
+    if "NCotas" not in df.columns:
+        # Tenta variações comuns
+        for c in df.columns:
+            if c.lower().strip() == "ncotas":
+                df.rename(columns={c: "NCotas"}, inplace=True)
+                break
+        if "NCotas" not in df.columns:
+            print("⚠️ Coluna 'NCotas' não encontrada no Carteira Diária.")
+            return None
+
+    # 6) Converte a coluna para número (pandas já entende decimal=',', mas reforçamos)
+    serie = pd.to_numeric(df["NCotas"], errors="coerce")
+    serie = serie.dropna()
+    if serie.empty:
+        return None
+
+    # 7) Último valor válido (última linha com número)
+    num = float(serie.iloc[-1])
+
+    # 8) Formata com 3 casas decimais e milhar com ponto
+    #    Primeiro cria em notação US (123,519,889.535), depois troca separadores:
+    texto = f"{num:,.3f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return texto
+
+
+
+def get_last_ncotas(carteira_csv: Path) -> Optional[str]:
+    """
+    Lê o arquivo Carteira Diária, ajusta o header (penúltima linha),
+    e retorna o último valor da coluna 'NCotas' formatado com 3 casas decimais e separador de milhar.
+    """
+    try:
+        # Lê todas as linhas com encoding correto
+        with open(carteira_csv, "r", encoding="latin-1") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        if len(lines) < 2:
+            return None
+
+        # Header está na penúltima linha
+        header_line = lines[-2]
+        data_lines = lines[:-2]
+
+        # Cria DataFrame com header correto
+        import io
+        df = pd.read_csv(io.StringIO("\n".join([header_line] + data_lines)),
+                         sep=";", decimal=",", engine="python", encoding="latin-1")
+
+        if "NCotas" not in df.columns:
+            return None
+
+        # Último valor válido
+        last_val = df["NCotas"].dropna().iloc[-1]
+
+        # Converte e formata
+        num = float(str(last_val).replace(".", "").replace(",", "."))
+        return f"{num:,.3f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception as e:
+        print(f"Erro ao processar Carteira Diária: {e}")
+        return None
+
+
+def get_last_vlcotas(carteira_csv: Path) -> Optional[str]:
+    """
+    Lê o arquivo Carteira Diária, usa o header da penúltima linha como cabeçalho,
+    pega o último valor válido da coluna 'VlCotas' e retorna em texto com 6 casas decimais.
+    Ex.: 123519889.535287 -> "123519889.535287" (ou com vírgula, se quiser trocar depois).
+    """
+    import io
+
+    # 1) Ler linhas cruas com encoding latino (evita UnicodeDecodeError em Ç/Á/etc.)
+    with open(carteira_csv, "r", encoding="latin-1", errors="ignore") as f:
+        raw_lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+
+    if len(raw_lines) < 2:
+        return None
+
+    # 2) Header na penúltima linha; dados = todas as anteriores
+    header_line = raw_lines[-2]
+    data_lines = raw_lines[:-2]
+
+    # 3) Montar CSV com header na primeira linha
+    csv_text = "\n".join([header_line] + data_lines)
+
+    # 4) Ler em pandas respeitando separador e decimal
+    #    Aqui usamos decimal="," porque os números do arquivo vêm no padrão PT-BR
+    df = pd.read_csv(
+        io.StringIO(csv_text),
+        sep=";",
+        decimal=",",
+        engine="python",
+        encoding="latin-1",
+    )
+
+    # 5) Normalizar nomes de colunas (tira espaços)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 6) Garantir a coluna 'VlCotas'
+    if "VlCotas" not in df.columns:
+        # Tenta variações de letra maiuscula/minuscula/espacos
+        for c in df.columns:
+            if c.lower().strip() == "vlcotas":
+                df.rename(columns={c: "VlCotas"}, inplace=True)
+                break
+        if "VlCotas" not in df.columns:
+            print("⚠️ Coluna 'VlCotas' não encontrada no Carteira Diária.")
+            return None
+
+    # 7) Converter para número (pandas já entende decimal=',')
+    serie = pd.to_numeric(df["VlCotas"], errors="coerce").dropna()
+    if serie.empty:
+        return None
+
+    # 8) Pegar o último valor válido
+    num = float(serie.iloc[-1])
+
+    # 9) Formatar com 6 casas decimais
+    #    Se quiser vírgula como decimal, troque por .replace(".", ",")
+    return f"{num:.6f}"
+
+
  
 from pathlib import Path
 from typing import Dict, Optional
@@ -349,6 +504,15 @@ def replace_in_dem_pl(
     ws0[CEL_EXTRA].number_format = "@"
 
 
+    
+    # --- NOVO: preencher D18 com NCotas da Carteira Diária ---
+    
+    if CARTEIRA_CSV.exists():
+        val_d18 = get_last_ncotas(CARTEIRA_CSV)
+        if val_d18:
+            ws0["D18"].value = val_d18
+            ws0["D18"].number_format = "@"
+
  
     # ---------------------------
     # Passo 3: CNPJ em L8 (como texto), se informado
@@ -366,6 +530,9 @@ def replace_in_dem_pl(
     # ---------------------------
     path_saida = safe_save_workbook(wb, dem_out)
  
+ 
+
+
  
 def preencher_movimento_cotistas(dem_out: Path, mov_path: Path):
     """
